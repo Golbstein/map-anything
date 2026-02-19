@@ -1,0 +1,95 @@
+# MapAnything 4-Camera Equirectangular Rig Configuration
+# Pose estimation: xyz + yaw(cos,sin) with rig consistency regularizers.
+#
+# Usage: loaded by train/train_buildots_rig.py as an OmegaConf dict or
+# passed directly to model_factory / MapAnything.__init__().
+
+model:
+  model_str: mapanything
+  model_config:
+    name: mapanything_rig_pose360
+
+    # --- Prediction head ---
+    pred_head_config:
+      type: "dpt+pose360"
+      adaptor_type: "raydirs+depth+pose360"
+      # DPT adaptor config (ray_directions 3ch + depth 1ch = 4ch output)
+      dpt_adaptor:
+        num_output_channels: 4
+      # Scale adaptor
+      scale_adaptor:
+        num_output_channels: 1
+
+    # --- Geometric input config ---
+    geometric_input_config:
+      # Probability controls
+      overall_prob: 1.0
+      dropout_prob: 0.0
+      ray_dirs_prob: 1.0
+      depth_prob: 0.0          # no GT depth available
+      cam_prob: 1.0            # anchor poses for t=0
+      sparse_depth_prob: 0.0
+      depth_scale_norm_all_prob: 0.0
+      pose_scale_norm_all_prob: 0.0
+      sparsification_removal_percent: 0.0
+
+      # Rig-specific probabilities (always on)
+      rig_rot_prob: 1.0
+      timestamp_prob: 1.0
+      time_freqs: 64
+
+      # Rig rotation encoder (same structure as cam_rot_encoder)
+      # Input: quaternion (4,) -> enc_embed_dim
+      # enc_embed_dim is set automatically from the image encoder
+      rig_rot_encoder_config:
+        encoder_type: "global_rep_mlp"
+        input_dim: 4
+
+      # Timestamp encoder
+      # Input: sinusoidal expansion (128,) -> enc_embed_dim
+      timestamp_encoder_config:
+        encoder_type: "global_rep_mlp"
+        input_dim: 128    # 2 * time_freqs
+
+# --- Loss configuration ---
+loss:
+  type: "Rig360PoseLoss"
+  trans_weight: 1.0
+  yaw_weight: 1.0
+  rig_trans_var_weight: 0.1
+  rig_yaw_consistency_weight: 0.1
+  num_cameras: 4
+
+# --- Training parameters ---
+train_params:
+  seed: 42
+  epochs: 100
+  batch_size: 4
+  num_workers: 8
+  num_timestamps_per_sample: 3
+
+  # Learning rates (differential)
+  lr: 1.0e-5                   # pretrained modules
+  lr_new_modules: 1.0e-4       # rig_rot_encoder, timestamp_encoder, pose360_head
+  weight_decay: 0.05
+  warmup_epochs: 5
+  min_lr: 1.0e-7
+
+  # Submodule configs for differential LR
+  submodule_configs:
+    rig_rot_encoder:
+      lr: 1.0e-4
+      weight_decay: 0.01
+    timestamp_encoder:
+      lr: 1.0e-4
+      weight_decay: 0.01
+    pose360_head:
+      lr: 1.0e-4
+      weight_decay: 0.01
+
+# --- Dataset ---
+dataset:
+  root_dir: "/bd-resources/jenia/dataset/buildots_da3"
+  seq_len: 10
+  image_size: [350, 350]
+  fov: 90
