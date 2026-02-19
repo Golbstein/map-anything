@@ -87,6 +87,12 @@ def get_args():
     parser.add_argument("--use_amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="use_amp", action="store_false")
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--accum_steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps. Effective batch size = batch_size * accum_steps.",
+    )
 
     # Loss weights
     parser.add_argument("--trans_weight", type=float, default=1.0)
@@ -154,6 +160,9 @@ def train_one_epoch(
 
     amp_dtype = torch.bfloat16 if args.use_amp else torch.float32
 
+    accum_steps = getattr(args, "accum_steps", 1)
+    num_loader = len(data_loader)
+
     for batch_idx, batch in enumerate(data_loader):
         # batch: list of V view-dicts, each value has shape (B, ...)
         # Move to device
@@ -162,7 +171,8 @@ def train_one_epoch(
                 if isinstance(v, torch.Tensor):
                     view[k] = v.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
+        if batch_idx % accum_steps == 0:
+            optimizer.zero_grad()
 
         with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=amp_dtype):
             preds = model(batch)
@@ -172,11 +182,14 @@ def train_one_epoch(
             print(f"WARNING: non-finite loss {loss.item()} at batch {batch_idx}, skipping")
             continue
 
+        loss_scaled = loss / accum_steps
+        do_step = (batch_idx + 1) % accum_steps == 0 or batch_idx == num_loader - 1
         scaler(
-            loss,
+            loss_scaled,
             optimizer,
             clip_grad=args.grad_clip,
             parameters=model.parameters(),
+            update_grad=do_step,
         )
 
         # Logging
@@ -248,9 +261,14 @@ def main():
     cudnn.benchmark = True
 
     # ---- Dataset ----
-    # Import BuildotsDataset from the user's codebase
+    # Import BuildotsDataset from the user's Buildots codebase
     import sys
-    sys.path.insert(0, "/Users/jenia/projects/buildots/pycode")
+    buildots_path = (
+        args.buildots_code_path
+        or os.environ.get("BUILDOTS_CODE_PATH", "/Users/jenia/projects/buildots/pycode")
+    )
+    if buildots_path not in sys.path:
+        sys.path.insert(0, buildots_path)
     from research.positioning_net.buildots_dataset_generator import BuildotsDataset
 
     train_ds = BuildotsDataset(
@@ -360,7 +378,12 @@ def main():
     print(f"\nStarting training for {args.epochs} epochs")
     print(f"  Train samples: {len(train_adapter)}, Val samples: {len(val_adapter)}")
     print(f"  Views per sample: {args.num_timestamps * 4}")
-    print(f"  Batch size: {args.batch_size}")
+    accum_steps = getattr(args, "accum_steps", 1)
+    eff_bs = args.batch_size * accum_steps
+    if accum_steps > 1:
+        print(f"  Batch size: {args.batch_size} (effective: {eff_bs}, accum_steps: {accum_steps})")
+    else:
+        print(f"  Batch size: {args.batch_size}")
 
     for epoch in range(1, args.epochs + 1):
         cosine_lr_schedule(
