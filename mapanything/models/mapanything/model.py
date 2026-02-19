@@ -7,12 +7,14 @@
 MapAnything model class defined using UniCeption modules.
 """
 
+import math
 import warnings
 from functools import partial
 from typing import Any, Callable, Dict, List, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin
 
 from mapanything.utils.geometry import (
@@ -83,6 +85,34 @@ if hasattr(torch.backends.cuda, "matmul") and hasattr(
     torch.backends.cuda.matmul, "allow_tf32"
 ):
     torch.backends.cuda.matmul.allow_tf32 = True
+
+
+class Cam360PoseHead(nn.Module):
+    """Pose head for equirectangular rig: predicts xyz translation + normalized yaw vector (cos, sin)."""
+
+    def __init__(self, dim_in: int):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Linear(dim_in, dim_in),
+            nn.ReLU(),
+            nn.Linear(dim_in, dim_in),
+            nn.ReLU(),
+        )
+        self.fc_t = nn.Linear(dim_in, 3)
+        self.fc_polar = nn.Linear(dim_in, 2)
+
+    def forward(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            feat: (B*V, C) pooled transformer features.
+        Returns:
+            trans: (B*V, 3) xyz translation.
+            polar: (B*V, 2) unit-normalized (cos_yaw, sin_yaw).
+        """
+        feat = self.backbone(feat)
+        trans = self.fc_t(feat.float())
+        polar = F.normalize(self.fc_polar(feat.float()), p=2, dim=-1)
+        return trans, polar
 
 
 class MapAnything(nn.Module, PyTorchModelHubMixin):
@@ -200,6 +230,23 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         ]
         cam_trans_scale_encoder_config["enc_embed_dim"] = self.encoder.enc_embed_dim
         self.cam_trans_scale_encoder = encoder_factory(**cam_trans_scale_encoder_config)
+
+        # Initialize rig rotation encoder (for 4-camera equirectangular rig)
+        if "rig_rot_encoder_config" in self.geometric_input_config:
+            rig_rot_encoder_config = self.geometric_input_config[
+                "rig_rot_encoder_config"
+            ]
+            rig_rot_encoder_config["enc_embed_dim"] = self.encoder.enc_embed_dim
+            self.rig_rot_encoder = encoder_factory(**rig_rot_encoder_config)
+
+        # Initialize timestamp encoder (sinusoidal expansion -> global encoder)
+        if "timestamp_encoder_config" in self.geometric_input_config:
+            self.time_freqs = self.geometric_input_config.get("time_freqs", 64)
+            timestamp_encoder_config = self.geometric_input_config[
+                "timestamp_encoder_config"
+            ]
+            timestamp_encoder_config["enc_embed_dim"] = self.encoder.enc_embed_dim
+            self.timestamp_encoder = encoder_factory(**timestamp_encoder_config)
 
         # Initialize the fusion norm layer
         self.fusion_norm_layer = fusion_norm_layer(self.encoder.enc_embed_dim)
@@ -373,14 +420,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 "feature_head"
             ]["feature_dim"]
             # Add dependencies for Pose head if required
-            if "pose" in self.pred_head_type:
+            if self.pred_head_type == "dpt+pose":
                 pred_head_config["pose_head"]["patch_size"] = self.encoder.patch_size
                 pred_head_config["pose_head"]["input_feature_dim"] = (
                     self.info_sharing.dim
                 )
         else:
             raise ValueError(
-                f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
+                f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose', 'dpt+pose360']"
             )
         pred_head_config["scale_head"]["input_feature_dim"] = self.info_sharing.dim
 
@@ -398,8 +445,10 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 self.dpt_feature_head, self.dpt_regressor_head
             )
             # Initialize Pose Head for all views if required
-            if "pose" in self.pred_head_type:
+            if self.pred_head_type == "dpt+pose":
                 self.pose_head = PoseHead(**pred_head_config["pose_head"])
+            elif self.pred_head_type == "dpt+pose360":
+                self.pose360_head = Cam360PoseHead(dim_in=self.info_sharing.dim)
         else:
             raise ValueError(
                 f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
@@ -457,6 +506,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 **pred_head_config["adaptor"]
             )
             self.scene_rep_type = "raymap+depth+confidence+mask"
+        elif pred_head_config["adaptor_type"] == "raydirs+depth+pose360":
+            assert self.pred_head_type == "dpt+pose360", (
+                "raydirs+depth+pose360 requires dpt+pose360 head type."
+            )
+            self.dense_adaptor = RayDirectionsPlusDepthAdaptor(
+                **pred_head_config["dpt_adaptor"]
+            )
+            self.scene_rep_type = "raydirs+depth+pose360"
         elif pred_head_config["adaptor_type"] == "raydirs+depth+pose":
             assert self.pred_head_type == "dpt+pose", (
                 "Ray directions + depth + pose can only be used as scene representation with dpt + pose head."
@@ -1159,6 +1216,98 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         return all_encoder_features_across_views
 
+    @staticmethod
+    def _sinusoidal_expand(x: torch.Tensor, num_freqs: int = 64) -> torch.Tensor:
+        """
+        Sinusoidal positional expansion for scalar values.
+
+        Args:
+            x: (..., 1) or (...,) float tensor.
+            num_freqs: number of frequency bands.
+        Returns:
+            (..., num_freqs * 2) sin/cos expansion.
+        """
+        if x.dim() == 1 or (x.dim() >= 2 and x.shape[-1] != 1):
+            x = x.unsqueeze(-1)
+        freqs = torch.pow(
+            2.0, torch.arange(num_freqs, dtype=torch.float32, device=x.device)
+        )
+        shape = [1] * (x.dim() - 1) + [-1]
+        freqs = freqs.view(*shape)
+        x_expanded = x * freqs
+        return torch.cat([torch.sin(x_expanded), torch.cos(x_expanded)], dim=-1)
+
+    def _encode_and_fuse_rig_and_timestamp(
+        self,
+        views,
+        num_views,
+        batch_size_per_view,
+        all_encoder_features_across_views,
+    ):
+        """
+        Encode known rig rotation and timestamp for all views, fuse with encoder features.
+
+        Rig rotation identifies which camera in the rig this view comes from.
+        Timestamp encodes temporal co-occurrence (all 4 cameras at the same time share the value).
+
+        Args:
+            views: List of view dicts.
+            num_views: Number of views.
+            batch_size_per_view: Batch size per view.
+            all_encoder_features_across_views: (B*V, C, H, W) encoder features.
+
+        Returns:
+            Updated all_encoder_features_across_views.
+        """
+        device = all_encoder_features_across_views.device
+        dtype = all_encoder_features_across_views.dtype
+
+        # --- Rig rotation ---
+        if hasattr(self, "rig_rot_encoder"):
+            rig_rot_list = []
+            has_rig = True
+            for view_idx in range(num_views):
+                if "rig_rotation" in views[view_idx]:
+                    rig_rot_list.append(views[view_idx]["rig_rotation"])
+                else:
+                    has_rig = False
+                    break
+            if has_rig:
+                rig_rot = torch.cat(rig_rot_list, dim=0).to(device=device, dtype=dtype)
+                rig_rot_features = self.rig_rot_encoder(
+                    EncoderGlobalRepInput(data=rig_rot)
+                ).features
+                all_encoder_features_across_views = (
+                    all_encoder_features_across_views
+                    + rig_rot_features.unsqueeze(-1).unsqueeze(-1)
+                )
+
+        # --- Timestamp ---
+        if hasattr(self, "timestamp_encoder"):
+            ts_list = []
+            has_ts = True
+            for view_idx in range(num_views):
+                if "timestamp" in views[view_idx]:
+                    ts_list.append(views[view_idx]["timestamp"])
+                else:
+                    has_ts = False
+                    break
+            if has_ts:
+                timestamps = torch.cat(ts_list, dim=0).to(
+                    device=device, dtype=torch.float32
+                )
+                scaled_ts = timestamps * (2.0 * math.pi * self.time_freqs)
+                ts_expanded = self._sinusoidal_expand(scaled_ts, self.time_freqs)
+                ts_features = self.timestamp_encoder(
+                    EncoderGlobalRepInput(data=ts_expanded)
+                ).features
+                all_encoder_features_across_views = (
+                    all_encoder_features_across_views
+                    + ts_features.unsqueeze(-1).unsqueeze(-1)
+                )
+
+        return all_encoder_features_across_views
+
     def _encode_and_fuse_optional_geometric_inputs(
         self, views, all_encoder_features_across_views_list
     ):
@@ -1271,6 +1420,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             per_sample_cam_input_mask,
         )
 
+        # Encode rig rotation and timestamp and fuse with the image encoder features
+        all_encoder_features_across_views = self._encode_and_fuse_rig_and_timestamp(
+            views,
+            num_views,
+            batch_size_per_view,
+            all_encoder_features_across_views,
+        )
+
         # Normalize the fused features (permute -> normalize -> permute)
         all_encoder_features_across_views = all_encoder_features_across_views.permute(
             0, 2, 3, 1
@@ -1346,7 +1503,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                     output_shape_hw=img_shape,
                 )
             )
-        elif self.pred_head_type in ["dpt", "dpt+pose"]:
+        elif "dpt" in self.pred_head_type:
             dense_head_outputs = self.dense_head(
                 PredictionHeadLayeredInput(
                     list_features=dense_head_inputs,
@@ -1361,7 +1518,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             )
         else:
             raise ValueError(
-                f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
+                f"Invalid pred_head_type: {self.pred_head_type}."
             )
 
         return dense_final_outputs
@@ -1395,11 +1552,11 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             # Obtain the batch size of the dense head inputs
             if self.pred_head_type == "linear":
                 batch_size = dense_head_inputs.shape[0]
-            elif self.pred_head_type in ["dpt", "dpt+pose"]:
+            elif "dpt" in self.pred_head_type:
                 batch_size = dense_head_inputs[0].shape[0]
             else:
                 raise ValueError(
-                    f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
+                    f"Invalid pred_head_type: {self.pred_head_type}."
                 )
 
             # Compute the mini batch size and number of mini batches
@@ -1413,6 +1570,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             # Run prediction for each mini-batch
             dense_final_outputs_list = []
             pose_final_outputs_list = [] if self.pred_head_type == "dpt+pose" else None
+            pose360_trans_list = [] if self.pred_head_type == "dpt+pose360" else None
+            pose360_polar_list = [] if self.pred_head_type == "dpt+pose360" else None
             for batch_idx in range(num_batches):
                 start_idx = batch_idx * minibatch
                 end_idx = min((batch_idx + 1) * minibatch, batch_size)
@@ -1420,13 +1579,13 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 # Get the inputs for the current mini-batch
                 if self.pred_head_type == "linear":
                     dense_head_inputs_batch = dense_head_inputs[start_idx:end_idx]
-                elif self.pred_head_type in ["dpt", "dpt+pose"]:
+                elif "dpt" in self.pred_head_type:
                     dense_head_inputs_batch = [
                         x[start_idx:end_idx] for x in dense_head_inputs
                     ]
                 else:
                     raise ValueError(
-                        f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
+                        f"Invalid pred_head_type: {self.pred_head_type}."
                     )
 
                 # Dense prediction (mini-batched)
@@ -1448,6 +1607,12 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                         )
                     )
                     pose_final_outputs_list.append(pose_final_outputs_batch)
+                elif self.pred_head_type == "dpt+pose360":
+                    pose360_feat_batch = dense_head_inputs[-1][start_idx:end_idx]
+                    pooled = pose360_feat_batch.mean(dim=(-2, -1))
+                    t_batch, p_batch = self.pose360_head(pooled)
+                    pose360_trans_list.append(t_batch)
+                    pose360_polar_list.append(p_batch)
 
             # Concatenate the dense prediction head outputs from all mini-batches
             available_keys = dense_final_outputs_batch.__dict__.keys()
@@ -1463,6 +1628,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
             # Concatenate the pose prediction head outputs from all mini-batches
             pose_final_outputs = None
+            pose360_outputs = None
             if self.pred_head_type == "dpt+pose":
                 available_keys = pose_final_outputs_batch.__dict__.keys()
                 pose_pred_data_dict = {
@@ -1474,6 +1640,11 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 }
                 pose_final_outputs = pose_final_outputs_batch.__class__(
                     **pose_pred_data_dict
+                )
+            elif self.pred_head_type == "dpt+pose360":
+                pose360_outputs = (
+                    torch.cat(pose360_trans_list, dim=0),
+                    torch.cat(pose360_polar_list, dim=0),
                 )
 
             # Clear CUDA cache for better memory efficiency
@@ -1488,6 +1659,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
             # Pose prediction
             pose_final_outputs = None
+            pose360_outputs = None
             if self.pred_head_type == "dpt+pose":
                 pose_head_outputs = self.pose_head(
                     PredictionHeadInput(last_feature=dense_head_inputs[-1])
@@ -1498,6 +1670,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                         output_shape_hw=img_shape,
                     )
                 )
+            elif self.pred_head_type == "dpt+pose360":
+                pooled = dense_head_inputs[-1].mean(dim=(-2, -1))
+                pose360_outputs = self.pose360_head(pooled)
 
         # Scale prediction is lightweight, so we can run it in one go
         scale_head_output = self.scale_head(
@@ -1515,7 +1690,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         if memory_efficient_inference and device.type == "cuda":
             torch.cuda.empty_cache()
 
-        return dense_final_outputs, pose_final_outputs, scale_final_output
+        return dense_final_outputs, pose_final_outputs, scale_final_output, pose360_outputs
 
     def forward(self, views, memory_efficient_inference=False, minibatch_size=None):
         """
@@ -1595,7 +1770,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             dense_head_inputs = torch.cat(
                 final_info_sharing_multi_view_feat.features, dim=0
             )
-        elif self.pred_head_type in ["dpt", "dpt+pose"]:
+        elif "dpt" in self.pred_head_type:
             # Get the list of features for all views
             dense_head_inputs_list = []
             if self.use_encoder_features_for_dpt:
@@ -1642,21 +1817,21 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 dense_head_inputs_list.append(stacked_final_features)
         else:
             raise ValueError(
-                f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
+                f"Invalid pred_head_type: {self.pred_head_type}."
             )
 
         with torch.autocast("cuda", enabled=False):
             # Prepare inputs for the downstream heads
             if self.pred_head_type == "linear":
                 dense_head_inputs = dense_head_inputs
-            elif self.pred_head_type in ["dpt", "dpt+pose"]:
+            elif "dpt" in self.pred_head_type:
                 dense_head_inputs = dense_head_inputs_list
             scale_head_inputs = (
                 final_info_sharing_multi_view_feat.additional_token_features
             )
 
             # Run the downstream heads
-            dense_final_outputs, pose_final_outputs, scale_final_output = (
+            dense_final_outputs, pose_final_outputs, scale_final_output, pose360_outputs = (
                 self.downstream_head(
                     dense_head_inputs=dense_head_inputs,
                     scale_head_inputs=scale_head_inputs,
@@ -1727,6 +1902,42 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                             "ray_directions": output_ray_directions_per_view[i],
                             "depth_along_ray": output_depth_along_ray_per_view[i]
                             * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                            "metric_scaling_factor": scale_final_output,
+                        }
+                    )
+            elif self.scene_rep_type == "raydirs+depth+pose360":
+                # Reshape output dense rep to (B * V, H, W, C)
+                output_dense_rep = dense_final_outputs.value.permute(
+                    0, 2, 3, 1
+                ).contiguous()
+                output_ray_directions, output_depth_along_ray = output_dense_rep.split(
+                    [3, 1], dim=-1
+                )
+                # Get pose360 outputs: (B*V, 3) trans and (B*V, 2) polar
+                output_cam_trans_360, output_cam_yaw_360 = pose360_outputs
+                # Split back to per-view
+                output_ray_directions_per_view = output_ray_directions.chunk(
+                    num_views, dim=0
+                )
+                output_depth_along_ray_per_view = output_depth_along_ray.chunk(
+                    num_views, dim=0
+                )
+                output_cam_trans_360_per_view = output_cam_trans_360.chunk(
+                    num_views, dim=0
+                )
+                output_cam_yaw_360_per_view = output_cam_yaw_360.chunk(
+                    num_views, dim=0
+                )
+                res = []
+                for i in range(num_views):
+                    res.append(
+                        {
+                            "ray_directions": output_ray_directions_per_view[i],
+                            "depth_along_ray": output_depth_along_ray_per_view[i]
+                            * scale_final_output.unsqueeze(-1).unsqueeze(-1),
+                            "cam_trans": output_cam_trans_360_per_view[i]
+                            * scale_final_output,
+                            "cam_yaw": output_cam_yaw_360_per_view[i],
                             "metric_scaling_factor": scale_final_output,
                         }
                     )
