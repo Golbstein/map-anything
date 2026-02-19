@@ -46,7 +46,9 @@ class BuildotsRigAdapter(Dataset):
         self.num_timestamps = num_timestamps
         self.data_norm_type = data_norm_type
 
-        # Pre-compute ray directions from the fixed intrinsics (shared across all cameras)
+        # Pre-compute ray directions from the fixed intrinsics (shared across all cameras).
+        # In each camera's local frame, the ray through pixel (u,v) is given by the same
+        # pinhole formula, so one ray map from intrinsics alone is correct for all views.
         intrinsics = self.dataset.intrinsic  # (3, 3)
         h, w = self.dataset.target_size
         _, ray_dirs = get_rays_in_camera_frame(
